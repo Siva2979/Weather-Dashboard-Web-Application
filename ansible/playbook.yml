@@ -1,0 +1,147 @@
+---
+- name: Deploy Weather App
+  hosts: all
+  become: yes
+  vars:
+    app_user: ubuntu
+    app_dir: /opt/weather-app
+    
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        
+    - name: Install Node.js and npm
+      shell: |
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+        apt-get install -y nodejs
+        
+    - name: Install rsync
+      apt:
+        name: rsync
+        state: present
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+        
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        
+    - name: Sync backend files
+      synchronize:
+        src: "../backend/"
+        dest: "{{ app_dir }}/backend"
+        rsync_opts:
+          - "--delete"
+        use_ssh_args: yes
+        ssh_args: "-i /root/.ssh/mars.pem"
+      delegate_to: localhost
+
+    - name: Set ownership for backend
+      file:
+        path: "{{ app_dir }}/backend"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+
+    - name: Sync frontend build
+      synchronize:
+        src: "../frontend/build/"
+        dest: "{{ app_dir }}/frontend"
+        rsync_opts:
+          - "--delete"
+        use_ssh_args: yes
+        ssh_args: "-i /root/.ssh/mars.pem"
+      delegate_to: localhost
+
+    - name: Set ownership for frontend
+      file:
+        path: "{{ app_dir }}/frontend"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: yes
+        
+    - name: Install backend dependencies
+      npm:
+        path: "{{ app_dir }}/backend"
+        state: present
+        
+    - name: Create .env file for backend
+      copy:
+        dest: "{{ app_dir }}/backend/.env"
+        content: |
+          OPENWEATHER_API_KEY={{ openweather_api_key }}
+          PORT=5000
+          NODE_ENV=production
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0600'
+        
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        
+    - name: Configure nginx
+      copy:
+        dest: /etc/nginx/sites-available/weather-app
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              root {{ app_dir }}/frontend;
+              index index.html;
+              
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+              
+              location /api {
+                  proxy_pass http://localhost:5000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart nginx
+      
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/weather-app
+        dest: /etc/nginx/sites-enabled/weather-app
+        state: link
+        
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+      
+    - name: Start backend with PM2
+      shell: |
+        pm2 delete weather-backend || true
+        cd {{ app_dir }}/backend
+        pm2 start server.js --name weather-backend
+        pm2 save
+        pm2 startup systemd -u {{ app_user }} --hp /home/{{ app_user }} || true
+      become_user: "{{ app_user }}"
+      
+  handlers:
+    - name: restart nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
